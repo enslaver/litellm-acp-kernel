@@ -34,19 +34,21 @@ The core design principle of acp-kernel is **the model writes the summaries; the
 4. **Replace and replay.** The proxy hides the `compress` call from the client, applies the summary to the session state, replaces the original range with it, and replays the request upstream (up to `ACP_KERNEL_MAX_ROUNDS` times). The client sees an ordinary response, streamed or not.
 5. **Compound.** Summaries are stored in a 3-tier LSM-style hierarchy. As summaries accumulate, the kernel nudges the model to merge them into denser ones, so history keeps shrinking instead of just being capped.
 
-Other kernel behavior that helps:
+Other kernel behavior that applies here:
 
-- **Protected content** is filtered out of compression, so content that must stay verbatim isn't summarized away.
+- **Protected zones.** The compress calls themselves, the recent zone, the first user message (task intent) and the last user message are never compressed. This is enforced by the kernel, not by prompt text.
 - **Emergency truncation** is a last resort when context is about to overflow.
-- **Lossless offload (CCR)** can replace large tool results with a small placeholder and let the model fetch the original back on demand. It is opt-in in the kernel (via `ACP_KERNEL_CONFIG`) and off by default.
-- **Decompress and search** let the model look a compressed block back up if it needs the detail.
+- **Window-scaled thresholds.** Nudge thresholds scale with `ACP_KERNEL_CONTEXT_LIMIT`, so set it to the real window of the model you route to.
+
+Not exposed through this proxy yet: the kernel's `decompress`, `search_context` and lossless tool-result offload (CCR). The proxy only injects the `compress` tool, so summaries cannot be restored by the model mid-session.
 
 ### Trade-offs
 
-- Writing a summary costs the model some output tokens, and a compression turn costs an extra upstream round. This pays back over the remaining turns of the session, so it matters most for long ones.
-- Summaries are lossy. Quality depends on the model you route to; use the protected-content and CCR features for anything that must be exact.
-- Rewriting history changes the prompt prefix at the moment of compression, so provider-side prompt caching resets for that turn. Between compressions the kernel's placeholders are deterministic, which keeps the prefix stable.
-- Session state lives in memory per proxy process (see below).
+- **Overhead per request.** The compression doctrine adds roughly 2K tokens of system prompt to every request. In the paper's 16K-window test that was about a 25% fixed overhead and one-shot compaction was cheaper; the overhead amortizes at 64K+ windows. Use this for models with large windows and long sessions.
+- **Compression turns cost extra.** The model writes a summary (output tokens) and the proxy replays the request upstream. The paper measures summary output at a median of 185 tokens, so this pays back quickly, but it is not free.
+- **Summaries are lossy.** Quality depends on the model you route to, and restore tools are not exposed here (see above). Tasks that need verbatim history (audits, compliance, forensics) are outside what this approach is meant for.
+- **Cache.** Compression replaces a range of history, so provider-side prompt cache is lost from the start of that range onward. The kernel folds the already-consumed increment rather than rewriting the whole history, which keeps the earlier prefix stable; the paper reports 94% cache-read share at active tempo on its own hosts. This proxy has not measured that yet.
+- **Session state is in memory** per proxy process (see below).
 
 ## Install
 
@@ -70,15 +72,45 @@ Environment:
 
 Sessions are keyed by API key, model and `x-acp-session` header. State is in memory per process.
 
-## Measuring savings
+## Evidence
 
-Compare token usage with the callback on and off for the same workload:
+The compression method is the one described in [*Model-Driven Incremental Hierarchical Compression*](https://github.com/ranxianglei/billion-context/blob/master/paper/model-driven-incremental-hierarchical-compression-training-free-multi-generational-context-management-for-long-lived-coding-agents.md) (Ran, preprint v0.2, 2026-09-07), whose reference system runs on acp-kernel. Numbers below are the paper's, self-reported by its author from their own deployments and a small pilot. **They were not measured on this LiteLLM callback**, and the paper's own caveats apply.
 
-- LiteLLM logs `usage.prompt_tokens` for every request; the callback also records it per session. Sum prompt tokens per session with and without `ACP_KERNEL_MODELS` set for your model.
-- Multiply by your provider's input price (LiteLLM's spend logs do this for you) to get the cost difference.
-- Watch for requests that include a `compress` round: those are the ones that pay for a summary.
+Controlled pilot (Qwen3.8-27B, 65,536-token window, synthetic multi-task coding sessions, compared against a sliding window that keeps full history):
 
-Measured benchmarks for this proxy aren't published yet; contributions are welcome.
+| Workload | Billed tokens vs sliding window | Recall probes |
+|---|---|---|
+| Repetitive, 6 passes | 31% fewer (default tuning), 54% fewer (aggressive tuning) | Equal under default tuning |
+| Phase-structured migration, 3 seeds | 50% fewer (4.67M vs 9.40M), lowest variance of any arm | 81.6% vs 80.9% |
+| Task-order permutations, 3 seeds | 52–53% fewer, 4–7× lower variance | Equal or better |
+
+Production use (author's own daily-driver hosts, up to 4.5 months):
+
+| Measure | Result |
+|---|---|
+| Models with a 204,800-token window | 42,986 calls, zero window overflows, peak 198,628 tokens |
+| Typical per-call context (Pi host) | mean 88K, median 72K tokens |
+| Cumulative input processed | 18.76B tokens on the main host over 4.5 months, in sessions up to 12,049 calls |
+| Per-block compression | median 7.9×; tool-heavy blocks median 24× |
+| Summary size | median 185 tokens, 97.5% of summaries ≤ 2K tokens |
+| Heavy sessions | about 70× standing compression (~900K tokens of history held as ~13K of summaries) |
+| Cache-read share | 94.2% at active tempo, 90.7% blended |
+
+Where it helps most, per the paper's own model: on a 1M-token window, a long session's input is modeled at about 5.3× lower than threshold-compaction would give. On 200K windows the modeled raw saving is smaller, 1.2–1.8×, and the main benefit is that sessions never overflow and can run indefinitely. The paper notes that compression activity is concentrated in marathon sessions: 62% of compressed tokens came from the 1.3% of sessions with 1,000+ messages.
+
+Caveats stated by the paper: single-expert production data, a small pilot on one model, probe scores near the suite's ceiling, and an ablation showing that most of the re-fetch reduction (−62% of −63%) comes from the doctrine text plus message tags rather than the compression itself.
+
+## Measuring savings on your own traffic
+
+- LiteLLM logs `usage.prompt_tokens` per request; the callback records it per session. Compare per-session prompt tokens for the same workload with and without your model in `ACP_KERNEL_MODELS`.
+- Multiply by your provider's input price (LiteLLM's spend logs do this) for the cost difference. If your provider discounts cached input, compare cached and uncached tokens separately.
+- Requests that include a `compress` round are the ones that pay for a summary.
+
+Published measurements for this proxy are welcome as a PR.
+
+## A note on the name
+
+ACP here means Active Context Pruning, the kernel's name. It is unrelated to the Agent Client Protocol or the Agent Communication Protocol.
 
 ## Test
 
