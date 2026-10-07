@@ -1,0 +1,14 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "litellm-acp-kernel"
+version = "0.1.0"
+description = "LiteLLM proxy callback that adds ACP kernel model-driven context compression"
+requires-python = ">=3.9"
+dependencies = ["litellm[proxy]>=1.60"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/litellm_acp_kernel"]
+include = ["src/litellm_acp_kernel/sidecar.mjs"]
