@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: check src tests
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build acp-kernel
+        run: |
+          git clone --depth 1 https://github.com/ranxianglei/acp-kernel "$RUNNER_TEMP/acp-kernel"
+          cd "$RUNNER_TEMP/acp-kernel"
+          npm ci
+          npm run build
+      - name: Install
+        run: pip install -e . pytest pytest-asyncio
+      - name: Test
+        env:
+          ACP_KERNEL_DIR: ${{ runner.temp }}/acp-kernel
+        run: pytest tests

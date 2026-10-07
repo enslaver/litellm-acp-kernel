@@ -1,10 +1,16 @@
 # litellm-acp-kernel
 
+[![CI](https://github.com/enslaver/litellm-acp-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/enslaver/litellm-acp-kernel/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/enslaver/litellm-acp-kernel/actions/workflows/codeql.yml/badge.svg)](https://github.com/enslaver/litellm-acp-kernel/actions/workflows/codeql.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 LiteLLM proxy callback that adds [acp-kernel](https://github.com/ranxianglei/acp-kernel) model-driven context compression to `/v1/chat/completions` (streaming and non-streaming). The kernel runs unmodified in a managed Node sidecar. Requires Node 18+ and a built kernel checkout.
 
 ## Install
 
     pip install litellm-acp-kernel
+
+Then build [acp-kernel](https://github.com/ranxianglei/acp-kernel) (`npm ci && npm run build`) and point `ACP_KERNEL_DIR` at it.
 
 ## Configure
 
@@ -25,3 +31,11 @@ Sessions are keyed by API key, model and `x-acp-session` header. State is in mem
 ## Test
 
     ACP_KERNEL_DIR=/path/to/kernel pytest tests
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities per [SECURITY.md](SECURITY.md).
+
+## License
+
+[MIT](LICENSE)
