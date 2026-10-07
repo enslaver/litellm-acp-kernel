@@ -40,7 +40,7 @@ Other kernel behavior that applies here:
 - **Emergency truncation** is a last resort when context is about to overflow.
 - **Window-scaled thresholds.** Nudge thresholds scale with `ACP_KERNEL_CONTEXT_LIMIT`, so set it to the real window of the model you route to.
 
-Not exposed through this proxy yet: the kernel's `decompress`, `search_context` and lossless tool-result offload (CCR). The proxy only injects the `compress` tool, so summaries cannot be restored by the model mid-session.
+Not exposed through this proxy yet: the kernel's `decompress`, `search_context` and lossless tool-result offload (CCR). The proxy only injects the `compress` tool, so summaries cannot be restored by the model mid-session. These are tracked in [TODO.md](TODO.md).
 
 ### Trade-offs
 
