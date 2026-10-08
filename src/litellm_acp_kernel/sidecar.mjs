@@ -23,6 +23,11 @@ const {
   viableRanges,
   COMPRESS_TOOL_NAME,
   COMPRESS_TOOL_OPENAI,
+  DECOMPRESS_TOOL_OPENAI,
+  SEARCH_CONTEXT_TOOL_OPENAI,
+  ACP_STATUS_TOOL_OPENAI,
+  parseBlockIdArg,
+  collectBlockContent,
   countMessageTokens,
 } = kernel;
 const { openaiToCore, coreToOpenai, injectOpenaiSystem } = wire;
@@ -39,10 +44,12 @@ const systemToUser = (messages) =>
 const fillNullContent = (messages) =>
   messages.map((m) => (m.role === "assistant" && (m.content === null || m.content === undefined) ? { ...m, content: "" } : m));
 
-const withCompressTool = (tools) => {
+const PROXY_TOOLS = [COMPRESS_TOOL_OPENAI, DECOMPRESS_TOOL_OPENAI, SEARCH_CONTEXT_TOOL_OPENAI, ACP_STATUS_TOOL_OPENAI];
+
+const withProxyTools = (tools) => {
   const existing = Array.isArray(tools) ? tools : [];
-  const present = existing.some((t) => t?.function?.name === COMPRESS_TOOL_NAME);
-  return present ? existing : [...existing, COMPRESS_TOOL_OPENAI];
+  const names = new Set(existing.map((t) => t?.function?.name));
+  return [...existing, ...PROXY_TOOLS.filter((t) => !names.has(t.function.name))];
 };
 
 function prepare({ body, state, contextLimit, tokenCount, config: overrides, injectNudge = true }) {
@@ -71,7 +78,7 @@ function prepare({ body, state, contextLimit, tokenCount, config: overrides, inj
       nudged = true;
     }
   }
-  return { messages, tools: withCompressTool(body.tools), state: turn.state, nudged };
+  return { messages, tools: withProxyTools(body.tools), state: turn.state, nudged };
 }
 
 function apply({ body, state, calls, contextLimit, config: overrides }) {
@@ -107,7 +114,63 @@ function apply({ body, state, calls, contextLimit, config: overrides }) {
   return { state: current, results };
 }
 
-const ops = { prepare, apply };
+const MAX_RESTORE_CHARS = 32000;
+
+const parseArgs = (call) => {
+  try {
+    const args = typeof call.arguments === "string" ? (call.arguments ? JSON.parse(call.arguments) : {}) : call.arguments;
+    return args && typeof args === "object" ? args : {};
+  } catch {
+    return null;
+  }
+};
+
+const clip = (text) =>
+  text.length > MAX_RESTORE_CHARS
+    ? `${text.slice(0, MAX_RESTORE_CHARS)}\n[truncated: ${text.length - MAX_RESTORE_CHARS} more characters]`
+    : text;
+
+// Read-only lookups: they never change session state, so the folded prefix stays cache-stable.
+function runTool(name, args, { body, state, contextLimit, config: overrides, tokenCount }) {
+  const current = state ?? createInitialState();
+  if (name === "decompress") {
+    const blockId = parseBlockIdArg(String(args.blockId ?? ""));
+    const block = blockId ? core.decompress(blockId, current) : undefined;
+    if (!block) return { ok: false, content: `decompress failed: unknown block ${JSON.stringify(args.blockId ?? "")}` };
+    const { msgs } = openaiToCore(body);
+    const { text, count } = collectBlockContent(current, block, msgs, { full: args.full === true });
+    if (!text) return { ok: false, content: `decompress failed: no original messages are available for ${block.blockId}` };
+    return { ok: true, content: clip(`Block ${block.blockId} (${count} message(s)):\n\n${text}`) };
+  }
+  if (name === "search_context") {
+    const query = String(args.query ?? "");
+    const limit = Number.isInteger(args.limit) && args.limit > 0 ? args.limit : 5;
+    const hits = core.search(query, current).slice(0, limit);
+    if (hits.length === 0) return { ok: true, content: `No compressed blocks match ${JSON.stringify(query)}.` };
+    return {
+      ok: true,
+      content: hits.map((b) => `${b.blockId}${b.topic ? ` (${b.topic})` : ""}: ${b.summary}`).join("\n\n"),
+    };
+  }
+  if (name === "acp_status") {
+    const { msgs } = openaiToCore(body);
+    const report = core.status(current, tokenCount ?? estimateTokens(msgs), configFor(contextLimit, overrides));
+    return { ok: true, content: JSON.stringify(report) };
+  }
+  return { ok: false, content: `unknown tool: ${name}` };
+}
+
+function tool({ calls, ...ctx }) {
+  return {
+    results: calls.map((call) => {
+      const args = parseArgs(call);
+      if (args === null) return { id: call.id, ok: false, content: `${call.name} arguments are not valid JSON` };
+      return { id: call.id, ...runTool(call.name, args, ctx) };
+    }),
+  };
+}
+
+const ops = { prepare, apply, tool };
 
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 for await (const line of rl) {

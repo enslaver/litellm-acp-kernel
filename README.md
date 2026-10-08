@@ -40,13 +40,13 @@ Other kernel behavior that applies here:
 - **Emergency truncation** is a last resort when context is about to overflow.
 - **Window-scaled thresholds.** Nudge thresholds scale with `ACP_KERNEL_CONTEXT_LIMIT`, so set it to the real window of the model you route to.
 
-Not exposed through this proxy yet: the kernel's `decompress`, `search_context` and lossless tool-result offload (CCR). The proxy only injects the `compress` tool, so summaries cannot be restored by the model mid-session. These are tracked in [TODO.md](TODO.md).
+The proxy also exposes `decompress`, `search_context` and `acp_status`. They are read-only lookups: `decompress` returns the original messages of a block (capped at 32K characters) in the tool result, so the folded prefix and its cache stay untouched. Lossless tool-result offload (CCR) is not exposed yet; see [TODO.md](TODO.md).
 
 ### Trade-offs
 
 - **Overhead per request.** The compression doctrine adds roughly 2K tokens of system prompt to every request. In the paper's 16K-window test that was about a 25% fixed overhead and one-shot compaction was cheaper; the overhead amortizes at 64K+ windows. Use this for models with large windows and long sessions.
 - **Compression turns cost extra.** The model writes a summary (output tokens) and the proxy replays the request upstream. The paper measures summary output at a median of 185 tokens, so this pays back quickly, but it is not free.
-- **Summaries are lossy.** Quality depends on the model you route to, and restore tools are not exposed here (see above). Tasks that need verbatim history (audits, compliance, forensics) are outside what this approach is meant for.
+- **Summaries are lossy.** Quality depends on the model you route to, and `decompress` can only restore content the client still sends, since the proxy keeps no copy of the originals. Tasks that need verbatim history (audits, compliance, forensics) are outside what this approach is meant for.
 - **Cache.** Compression replaces a range of history, so provider-side prompt cache is lost from the start of that range onward. The kernel folds the already-consumed increment rather than rewriting the whole history, which keeps the earlier prefix stable; the paper reports 94% cache-read share at active tempo on its own hosts. This proxy has not measured that yet.
 - **Session state is in memory** per proxy process (see below).
 

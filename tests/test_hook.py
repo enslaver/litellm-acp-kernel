@@ -60,7 +60,7 @@ def compress_args(start: str, end: str) -> str:
     )
 
 
-def tool_call_response(arguments: str, call_id: str = "call_1") -> ModelResponse:
+def tool_call_response(arguments: str, call_id: str = "call_1", name: str = "compress") -> ModelResponse:
     return ModelResponse(
         choices=[
             Choices(
@@ -70,7 +70,7 @@ def tool_call_response(arguments: str, call_id: str = "call_1") -> ModelResponse
                     content=None,
                     tool_calls=[
                         ChatCompletionMessageToolCall(
-                            id=call_id, type="function", function=Function(name="compress", arguments=arguments)
+                            id=call_id, type="function", function=Function(name=name, arguments=arguments)
                         )
                     ],
                 ),
@@ -280,3 +280,70 @@ async def test_sidecar_recovers_after_crash(harness):
     await harness.handler.sidecar._proc.wait()
     data = await prepare(harness, make_conversation(), "c2", session="s2")
     assert any(t["function"]["name"] == "compress" for t in data["tools"])
+
+
+async def compressed_session(harness):
+    conversation = make_conversation()
+    data = await prepare(harness, conversation, "c1")
+    refs = refs_in(data["messages"], "KEY_")
+    harness.next_response = text_response("ok")
+    await harness.handler.async_post_call_success_hook(
+        data, UserAPIKeyAuth(token="k1"), tool_call_response(compress_args(refs[0], refs[1]))
+    )
+    follow_up = conversation + [{"role": "assistant", "content": "ok"}, {"role": "user", "content": "next question"}]
+    return await prepare(harness, follow_up, "c2")
+
+
+async def test_pre_call_exposes_decompress_search_and_status_tools(harness):
+    data = await prepare(harness, make_conversation(), "c1")
+    names = {t["function"]["name"] for t in data["tools"]}
+    assert {"compress", "decompress", "search_context", "acp_status"} <= names
+
+
+async def test_decompress_returns_original_content_without_leaking_it_into_the_prefix(harness):
+    nxt = await compressed_session(harness)
+    harness.next_response = text_response("done")
+
+    await harness.handler.async_post_call_success_hook(
+        nxt, UserAPIKeyAuth(token="k1"), tool_call_response(json.dumps({"blockId": "b1"}), "d1", "decompress")
+    )
+
+    replay = harness.upstream_requests[-1]["messages"]
+    assert replay[-1]["role"] == "tool" and replay[-1]["tool_call_id"] == "d1"
+    assert "KEY_0" in replay[-1]["content"]
+    assert not any("KEY_0" in str(m.get("content")) for m in replay[:-1])
+
+
+async def test_decompress_unknown_block_reports_error_to_model(harness):
+    nxt = await compressed_session(harness)
+    harness.next_response = text_response("done")
+
+    await harness.handler.async_post_call_success_hook(
+        nxt, UserAPIKeyAuth(token="k1"), tool_call_response(json.dumps({"blockId": "b99"}), "d2", "decompress")
+    )
+
+    assert harness.upstream_requests[-1]["messages"][-1]["content"].startswith("decompress failed:")
+
+
+async def test_search_context_finds_compressed_block_by_summary(harness):
+    nxt = await compressed_session(harness)
+    harness.next_response = text_response("done")
+
+    await harness.handler.async_post_call_success_hook(
+        nxt, UserAPIKeyAuth(token="k1"), tool_call_response(json.dumps({"query": "the user asked to remember the marker keys"}), "s1", "search_context")
+    )
+
+    content = harness.upstream_requests[-1]["messages"][-1]["content"]
+    assert "SUMMARY_SENTINEL" in content and content.startswith("b")
+
+
+async def test_acp_status_reports_block_counts(harness):
+    nxt = await compressed_session(harness)
+    harness.next_response = text_response("done")
+
+    await harness.handler.async_post_call_success_hook(
+        nxt, UserAPIKeyAuth(token="k1"), tool_call_response("{}", "st1", "acp_status")
+    )
+
+    report = json.loads(harness.upstream_requests[-1]["messages"][-1]["content"])
+    assert report["activeBlocks"] == 1
