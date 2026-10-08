@@ -1,5 +1,6 @@
 import { createInterface } from "node:readline";
 import { join } from "node:path";
+import fs from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const kernelDir = process.argv[2];
@@ -34,6 +35,35 @@ const {
 } = kernel;
 const { openaiToCore, coreToOpenai, injectOpenaiSystem } = wire;
 
+// Optional on-disk session state (ACP_KERNEL_STATE_DIR). Files hold summaries and, with CCR, full
+// tool outputs, so the directory is created 0700 and files older than the TTL are removed at boot.
+const stateDir = process.env.ACP_KERNEL_STATE_DIR;
+const STATE_VERSION = 1;
+let stateStore = null;
+if (stateDir) {
+  const { StateStore } = await load("dist/persist/index.js");
+  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const ttlMs = Number(process.env.ACP_KERNEL_STATE_TTL_DAYS ?? 7) * 86_400_000;
+  for (const name of fs.readdirSync(stateDir)) {
+    const file = join(stateDir, name);
+    try {
+      if (Date.now() - fs.statSync(file).mtimeMs > ttlMs) fs.rmSync(file, { force: true });
+    } catch {}
+  }
+  stateStore = new StateStore({
+    dir: stateDir,
+    version: STATE_VERSION,
+    debounceMs: Number(process.env.ACP_KERNEL_STATE_DEBOUNCE_MS ?? 500),
+    log: (level, msg) => process.stderr.write(`[${level}] ${msg}\n`),
+    validate: (e) => e.version === STATE_VERSION && Array.isArray(e.payload?.state?.blocks),
+  });
+}
+
+const restore = (sessionKey) => {
+  if (!stateStore || !sessionKey) return null;
+  return stateStore.loadSync(sessionKey)?.payload ?? null;
+};
+
 const core = createCore();
 
 const configFor = (contextLimit, overrides) => defaultConfig(contextLimit, overrides ?? {});
@@ -55,9 +85,13 @@ const withProxyTools = (tools, ccrOn) => {
   return [...existing, ...extra.filter((t) => !names.has(t.function.name))];
 };
 
-function prepare({ body, state, contentStore, contextLimit, tokenCount, config: overrides, injectNudge = true }) {
+function prepare({ body, state, contentStore, sessionKey, contextLimit, tokenCount, config: overrides, injectNudge = true }) {
   const { msgs, systemText } = openaiToCore(body);
   const config = configFor(contextLimit, overrides);
+  if (!state) {
+    const restored = restore(sessionKey);
+    if (restored) ({ state, contentStore } = restored);
+  }
   const turn = core.processTurn({
     messages: msgs,
     state: state ?? createInitialState(),
@@ -73,6 +107,11 @@ function prepare({ body, state, contentStore, contextLimit, tokenCount, config: 
   if (systemText) systemParts.push(systemText);
   systemParts.push(buildCompressSystemPrompt(defaultPrompts));
   messages = injectOpenaiSystem(messages, systemParts);
+
+  if (stateStore && sessionKey) {
+    const saved = { state: turn.state, contentStore: turn.contentStore };
+    stateStore.scheduleSave(sessionKey, () => saved);
+  }
 
   let nudged = false;
   if (injectNudge && turn.nudge?.shouldInject) {

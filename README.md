@@ -49,7 +49,7 @@ The proxy also exposes `decompress`, `search_context` and `acp_status`. They are
 - **Compression turns cost extra.** The model writes a summary (output tokens) and the proxy replays the request upstream. The paper measures summary output at a median of 185 tokens, so this pays back quickly, but it is not free.
 - **Summaries are lossy.** Quality depends on the model you route to, and `decompress` can only restore content the client still sends, since the proxy keeps no copy of the originals. Tasks that need verbatim history (audits, compliance, forensics) are outside what this approach is meant for.
 - **Cache.** Compression replaces a range of history, so provider-side prompt cache is lost from the start of that range onward. The kernel folds the already-consumed increment rather than rewriting the whole history, which keeps the earlier prefix stable; the paper reports 94% cache-read share at active tempo on its own hosts. This proxy has not measured that yet.
-- **Session state is in memory** per proxy process (see below).
+- **Session state is in memory** per proxy process unless `ACP_KERNEL_STATE_DIR` is set (see below).
 
 ## Install
 
@@ -70,8 +70,11 @@ Environment:
 - `ACP_KERNEL_MAX_ROUNDS`: max compress replays per request, default 3
 - `ACP_KERNEL_CONFIG`: JSON overrides for the kernel config
 - `ACP_KERNEL_NODE`: node binary, default from PATH
+- `ACP_KERNEL_STATE_DIR`: persist session state (summaries and, with CCR, stored tool outputs) here so it survives proxy restarts. Off by default. Files can contain conversation content: the directory is created `0700`, so keep it private.
+- `ACP_KERNEL_STATE_TTL_DAYS`: files older than this are deleted at startup, default 7
+- `ACP_KERNEL_STATE_DEBOUNCE_MS`: write coalescing window, default 500. A crash can lose up to this much recent state.
 
-Sessions are keyed by API key, model and `x-acp-session` header. State is in memory per process.
+Sessions are keyed by API key, model and `x-acp-session` header. State is held in memory per process; with `ACP_KERNEL_STATE_DIR` it is also written to disk (via the kernel's crash-safe `StateStore`) and reloaded when a session is not in memory, e.g. after a restart or LRU eviction. Several workers sharing one directory is last-writer-wins and is not coordinated, so pin a session to one worker.
 
 ## Evidence
 

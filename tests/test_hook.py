@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -428,3 +429,63 @@ async def test_ccr_store_persists_across_turns(ccr_harness):
     )
 
     assert "TOOL_OUTPUT_SENTINEL" in ccr_harness.upstream_requests[-1]["messages"][-1]["content"]
+
+
+async def fresh_harness(monkeypatch, state_dir=None):
+    if state_dir is not None:
+        monkeypatch.setenv("ACP_KERNEL_STATE_DIR", str(state_dir))
+        monkeypatch.setenv("ACP_KERNEL_STATE_DEBOUNCE_MS", "0")
+    else:
+        monkeypatch.delenv("ACP_KERNEL_STATE_DIR", raising=False)
+    handler = _PROXY_AcpKernelHandler(
+        sidecar=AcpKernelSidecar(KERNEL_DIR), models={MODEL}, context_limit=4000, max_rounds=2
+    )
+    return Harness(handler)
+
+
+async def compress_then_restart(monkeypatch, state_dir):
+    first = await fresh_harness(monkeypatch, state_dir)
+    conversation = make_conversation()
+    data = await prepare(first, conversation, "c1")
+    refs = refs_in(data["messages"], "KEY_")
+    first.next_response = text_response("ok")
+    await first.handler.async_post_call_success_hook(
+        data, UserAPIKeyAuth(token="k1"), tool_call_response(compress_args(refs[0], refs[1]))
+    )
+    follow_up = conversation + [{"role": "assistant", "content": "ok"}, {"role": "user", "content": "next question"}]
+    await prepare(first, follow_up, "c2")
+    await asyncio.sleep(0.5)
+    await first.handler.sidecar.close()
+
+    second = await fresh_harness(monkeypatch, state_dir)
+    try:
+        return "\n".join(str(m.get("content")) for m in (await prepare(second, follow_up, "c3"))["messages"])
+    finally:
+        await second.handler.sidecar.close()
+
+
+async def test_state_survives_proxy_restart_with_state_dir(monkeypatch, tmp_path):
+    flattened = await compress_then_restart(monkeypatch, tmp_path / "state")
+    assert "SUMMARY_SENTINEL" in flattened
+    assert "KEY_0" not in flattened
+    assert oct((tmp_path / "state").stat().st_mode & 0o777) == "0o700"
+
+
+async def test_state_is_lost_on_restart_without_state_dir(monkeypatch):
+    flattened = await compress_then_restart(monkeypatch, None)
+    assert "SUMMARY_SENTINEL" not in flattened
+
+
+async def test_expired_state_files_are_removed_at_boot(monkeypatch, tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    stale = state / "old.json"
+    stale.write_text("{}")
+    os.utime(stale, (0, 0))
+    monkeypatch.setenv("ACP_KERNEL_STATE_TTL_DAYS", "1")
+    harness = await fresh_harness(monkeypatch, state)
+    try:
+        await prepare(harness, make_conversation(), "c1")
+    finally:
+        await harness.handler.sidecar.close()
+    assert not stale.exists()

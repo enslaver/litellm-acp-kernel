@@ -11,5 +11,5 @@ CCR itself is implemented (opt-in, inline retrieval).
 
 ## 2. Supporting work
 
-- [ ] Persist session state (summaries, content store) to disk or Redis so it survives proxy restarts and works across multiple workers. State is in memory per process today.
+- [ ] Coordinate persisted state across multiple workers (Redis or locking). Single-process persistence is done via `ACP_KERNEL_STATE_DIR`.
 - [ ] Add a benchmark script that replays a recorded conversation with and without the callback and reports prompt tokens, cost and cache-read share, so the README can cite measurements for this proxy rather than the paper's.

@@ -168,7 +168,8 @@ class _PROXY_AcpKernelHandler(CustomLogger):
             yield chunk
 
     async def _apply_and_prepare(self, original: _Original, calls: List[Dict[str, str]]) -> dict:
-        session = self._session(original.session_key)
+        session_key = original.session_key
+        session = self._session(session_key)
         compress_calls = [c for c in calls if c["name"] == COMPRESS_TOOL_NAME]
         info_calls = [c for c in calls if c["name"] in INFO_TOOL_NAMES]
         async with session.lock:
@@ -200,6 +201,7 @@ class _PROXY_AcpKernelHandler(CustomLogger):
                 body=original.body,
                 state=session.state,
                 contentStore=session.content_store,
+                sessionKey=session_key,
                 contextLimit=self.context_limit,
                 config=self.config_overrides,
                 tokenCount=None,
@@ -219,6 +221,7 @@ class _PROXY_AcpKernelHandler(CustomLogger):
                 body=body,
                 state=session.state,
                 contentStore=session.content_store,
+                sessionKey=session_key,
                 contextLimit=self.context_limit,
                 config=self.config_overrides,
                 tokenCount=session.last_prompt_tokens,
