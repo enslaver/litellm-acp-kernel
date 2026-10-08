@@ -40,7 +40,8 @@ Other kernel behavior that applies here:
 - **Emergency truncation** is a last resort when context is about to overflow.
 - **Window-scaled thresholds.** Nudge thresholds scale with `ACP_KERNEL_CONTEXT_LIMIT`, so set it to the real window of the model you route to.
 
-The proxy also exposes `decompress`, `search_context` and `acp_status`. They are read-only lookups: `decompress` returns the original messages of a block (capped at 32K characters) in the tool result, so the folded prefix and its cache stay untouched. Lossless tool-result offload (CCR) is not exposed yet; see [TODO.md](TODO.md).
+The proxy also exposes `decompress`, `search_context` and `acp_status`. They are read-only lookups: `decompress` returns the original messages of a block (capped at 32K characters) in the tool result, so the folded prefix and its cache stay untouched. 
+**Lossless offload (CCR), off by default.** Enable it with `ACP_KERNEL_CONFIG='{"ccr": {"enabled": true}}'`. Tool results above `ccr.minToolTokens` (default 4000) are stored per session and replaced in the request by a short placeholder with a ref; the model can call `acp_retrieve` to get the exact original back in the tool result. Originals are always returned inline (no export directory), so a retrieval of a large output re-adds those tokens for that turn. The store lives in proxy memory with the session and is not size-capped yet; see [TODO.md](TODO.md).
 
 ### Trade-offs
 

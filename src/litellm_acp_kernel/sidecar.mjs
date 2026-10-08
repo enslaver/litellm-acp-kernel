@@ -26,6 +26,8 @@ const {
   DECOMPRESS_TOOL_OPENAI,
   SEARCH_CONTEXT_TOOL_OPENAI,
   ACP_STATUS_TOOL_OPENAI,
+  RETRIEVE_TOOL_OPENAI,
+  createContentStore,
   parseBlockIdArg,
   collectBlockContent,
   countMessageTokens,
@@ -46,13 +48,14 @@ const fillNullContent = (messages) =>
 
 const PROXY_TOOLS = [COMPRESS_TOOL_OPENAI, DECOMPRESS_TOOL_OPENAI, SEARCH_CONTEXT_TOOL_OPENAI, ACP_STATUS_TOOL_OPENAI];
 
-const withProxyTools = (tools) => {
+const withProxyTools = (tools, ccrOn) => {
   const existing = Array.isArray(tools) ? tools : [];
   const names = new Set(existing.map((t) => t?.function?.name));
-  return [...existing, ...PROXY_TOOLS.filter((t) => !names.has(t.function.name))];
+  const extra = ccrOn ? [...PROXY_TOOLS, RETRIEVE_TOOL_OPENAI] : PROXY_TOOLS;
+  return [...existing, ...extra.filter((t) => !names.has(t.function.name))];
 };
 
-function prepare({ body, state, contextLimit, tokenCount, config: overrides, injectNudge = true }) {
+function prepare({ body, state, contentStore, contextLimit, tokenCount, config: overrides, injectNudge = true }) {
   const { msgs, systemText } = openaiToCore(body);
   const config = configFor(contextLimit, overrides);
   const turn = core.processTurn({
@@ -61,6 +64,7 @@ function prepare({ body, state, contextLimit, tokenCount, config: overrides, inj
     config,
     tokenCount: tokenCount ?? estimateTokens(msgs),
     renderTags: "text-only",
+    contentStore: contentStore ?? createContentStore(),
   });
   if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
 
@@ -78,7 +82,13 @@ function prepare({ body, state, contextLimit, tokenCount, config: overrides, inj
       nudged = true;
     }
   }
-  return { messages, tools: withProxyTools(body.tools), state: turn.state, nudged };
+  return {
+    messages,
+    tools: withProxyTools(body.tools, config.ccr?.enabled),
+    state: turn.state,
+    contentStore: turn.contentStore,
+    nudged,
+  };
 }
 
 function apply({ body, state, calls, contextLimit, config: overrides }) {
@@ -131,7 +141,7 @@ const clip = (text) =>
     : text;
 
 // Read-only lookups: they never change session state, so the folded prefix stays cache-stable.
-function runTool(name, args, { body, state, contextLimit, config: overrides, tokenCount }) {
+function runTool(name, args, { body, state, contentStore, contextLimit, config: overrides, tokenCount }) {
   const current = state ?? createInitialState();
   if (name === "decompress") {
     const blockId = parseBlockIdArg(String(args.blockId ?? ""));
@@ -156,6 +166,11 @@ function runTool(name, args, { body, state, contextLimit, config: overrides, tok
     const { msgs } = openaiToCore(body);
     const report = core.status(current, tokenCount ?? estimateTokens(msgs), configFor(contextLimit, overrides));
     return { ok: true, content: JSON.stringify(report) };
+  }
+  if (name === "acp_retrieve") {
+    if (!configFor(contextLimit, overrides).ccr?.enabled) return { ok: false, content: "acp_retrieve is not enabled" };
+    const out = core.retrieve(contentStore ?? createContentStore(), String(args.ref ?? ""));
+    return { ok: out.ok, content: out.toolResultText };
   }
   return { ok: false, content: `unknown tool: ${name}` };
 }

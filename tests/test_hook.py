@@ -347,3 +347,84 @@ async def test_acp_status_reports_block_counts(harness):
 
     report = json.loads(harness.upstream_requests[-1]["messages"][-1]["content"])
     assert report["activeBlocks"] == 1
+
+
+@pytest.fixture
+async def ccr_harness():
+    handler = _PROXY_AcpKernelHandler(
+        sidecar=AcpKernelSidecar(KERNEL_DIR),
+        models={MODEL},
+        context_limit=4000,
+        max_rounds=2,
+        config_overrides={"ccr": {"enabled": True, "minToolTokens": 100}},
+    )
+    yield Harness(handler)
+    await handler.sidecar.close()
+
+
+BIG_OUTPUT = "TOOL_OUTPUT_SENTINEL " + "line of build output " * 400
+
+
+def tool_conversation() -> List[dict]:
+    return [
+        {"role": "system", "content": "You are a test assistant."},
+        {"role": "user", "content": "run the build"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "bash", "arguments": '{"command": "make"}'}}],
+        },
+        {"role": "tool", "tool_call_id": "t1", "content": BIG_OUTPUT},
+        {"role": "assistant", "content": "build finished"},
+        {"role": "user", "content": "what failed?"},
+    ]
+
+
+async def test_ccr_off_by_default_hides_retrieve_tool_and_keeps_tool_output(harness):
+    data = await prepare(harness, tool_conversation(), "c1")
+    assert "acp_retrieve" not in {t["function"]["name"] for t in data["tools"]}
+    assert any("TOOL_OUTPUT_SENTINEL" in str(m.get("content")) for m in data["messages"])
+
+
+async def test_ccr_replaces_large_tool_result_and_retrieve_returns_original(ccr_harness):
+    data = await prepare(ccr_harness, tool_conversation(), "c1")
+    assert "acp_retrieve" in {t["function"]["name"] for t in data["tools"]}
+    assert not any("TOOL_OUTPUT_SENTINEL" in str(m.get("content")) for m in data["messages"])
+    placeholder = next(m["content"] for m in data["messages"] if m.get("role") == "tool")
+    ref = re.search(r"\bm\d{5}\b", placeholder).group(0)
+    ccr_harness.next_response = text_response("done")
+
+    await ccr_harness.handler.async_post_call_success_hook(
+        data, UserAPIKeyAuth(token="k1"), tool_call_response(json.dumps({"ref": ref}), "r1", "acp_retrieve")
+    )
+
+    replay = ccr_harness.upstream_requests[-1]["messages"]
+    assert replay[-1]["tool_call_id"] == "r1"
+    assert "TOOL_OUTPUT_SENTINEL" in replay[-1]["content"]
+
+
+async def test_ccr_retrieve_unknown_ref_reports_not_found(ccr_harness):
+    data = await prepare(ccr_harness, tool_conversation(), "c1")
+    ccr_harness.next_response = text_response("done")
+
+    await ccr_harness.handler.async_post_call_success_hook(
+        data, UserAPIKeyAuth(token="k1"), tool_call_response(json.dumps({"ref": "m99999"}), "r2", "acp_retrieve")
+    )
+
+    assert "TOOL_OUTPUT_SENTINEL" not in ccr_harness.upstream_requests[-1]["messages"][-1]["content"]
+
+
+async def test_ccr_store_persists_across_turns(ccr_harness):
+    conversation = tool_conversation()
+    data = await prepare(ccr_harness, conversation, "c1")
+    placeholder = next(m["content"] for m in data["messages"] if m.get("role") == "tool")
+    ref = re.search(r"\bm\d{5}\b", placeholder).group(0)
+    follow_up = conversation + [{"role": "assistant", "content": "x"}, {"role": "user", "content": "again"}]
+    nxt = await prepare(ccr_harness, follow_up, "c2")
+    ccr_harness.next_response = text_response("done")
+
+    await ccr_harness.handler.async_post_call_success_hook(
+        nxt, UserAPIKeyAuth(token="k1"), tool_call_response(json.dumps({"ref": ref}), "r3", "acp_retrieve")
+    )
+
+    assert "TOOL_OUTPUT_SENTINEL" in ccr_harness.upstream_requests[-1]["messages"][-1]["content"]

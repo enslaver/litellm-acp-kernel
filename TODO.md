@@ -1,18 +1,13 @@
 # TODO
 
-The proxy currently exposes the kernel's `compress`, `decompress`, `search_context` and `acp_status` tools; `decompress` returns originals only when the client resends them. These items bring it closer to the full [acp-kernel](https://github.com/ranxianglei/acp-kernel) feature set described in the paper. Names and signatures come from the kernel README; verify against the pinned kernel version before starting.
+The proxy currently exposes the kernel's `compress`, `decompress`, `search_context` and `acp_status` tools, plus `acp_retrieve` when CCR is enabled; `decompress` returns originals only when the client resends them. These items bring it closer to the full [acp-kernel](https://github.com/ranxianglei/acp-kernel) feature set described in the paper. Names and signatures come from the kernel README; verify against the pinned kernel version before starting.
 
-## 1. CCR: lossless tool-result offload
+## 1. CCR follow-ups
 
-Replace large tool results with a small placeholder and let the model fetch the original on demand. This is the lossless alternative to lossy summaries.
+CCR itself is implemented (opt-in, inline retrieval).
 
-- [ ] Pass `contentStore` into and out of `processTurn` per session. Add it to `_Session` in `hook.py` and make sure it is covered by the per-session lock.
-- [ ] Enable it via config (`ccr: { enabled: true, ... }` through `ACP_KERNEL_CONFIG`), off by default.
-- [ ] Expose the `acp_retrieve` tool and wrap `core.retrieve(contentStore, ref, { exportDir })`.
-- [ ] Decide how large originals are returned. The kernel exports originals over `ccr.retrieveInlineTokens` (default 4000) to a file and returns a pointer; the proxy has no file-read tool for the client's model, so either inline them regardless of size or document the limit.
-- [ ] Add `ACP_KERNEL_EXPORT_DIR`, with a safe default and cleanup of exported files when a session expires.
-- [ ] Memory: the content store holds full tool outputs. Bound it (per-session size cap, eviction with the existing session LRU).
-- [ ] Tests: store at arrival, retrieve inline, retrieve oversized, store survives across turns, isolation between sessions and API keys.
+- [ ] Bound the content store (per-session size cap, eviction with the session LRU). It currently grows with every stored tool result.
+- [ ] Optional export directory for very large originals, if a file-read path for the client's model exists.
 
 ## 2. Supporting work
 

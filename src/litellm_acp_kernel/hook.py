@@ -13,7 +13,7 @@ from litellm.proxy._types import UserAPIKeyAuth
 from litellm_acp_kernel.sidecar_client import AcpKernelSidecar
 
 COMPRESS_TOOL_NAME = "compress"
-INFO_TOOL_NAMES = frozenset({"decompress", "search_context", "acp_status"})
+INFO_TOOL_NAMES = frozenset({"decompress", "search_context", "acp_status", "acp_retrieve"})
 HIDDEN_TOOL_NAMES = INFO_TOOL_NAMES | {COMPRESS_TOOL_NAME}
 SESSION_HEADER = "x-acp-session"
 DEFAULT_CONTEXT_LIMIT = 128_000
@@ -28,6 +28,7 @@ INTERNAL_REQUEST_KEYS = frozenset(
 @dataclass
 class _Session:
     state: Optional[dict] = None
+    content_store: Optional[dict] = None
     last_prompt_tokens: Optional[int] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -188,6 +189,7 @@ class _PROXY_AcpKernelHandler(CustomLogger):
                     "tool",
                     body=original.body,
                     state=session.state,
+                    contentStore=session.content_store,
                     calls=info_calls,
                     contextLimit=self.context_limit,
                     config=self.config_overrides,
@@ -197,12 +199,14 @@ class _PROXY_AcpKernelHandler(CustomLogger):
                 "prepare",
                 body=original.body,
                 state=session.state,
+                contentStore=session.content_store,
                 contextLimit=self.context_limit,
                 config=self.config_overrides,
                 tokenCount=None,
                 injectNudge=False,
             )
             session.state = prepared["state"]
+            session.content_store = prepared["contentStore"]
         feedback = _failure_feedback(compress_calls, applied["results"]) + _tool_results(info_calls, looked_up["results"])
         prepared["messages"] = prepared["messages"] + feedback
         return prepared
@@ -214,12 +218,14 @@ class _PROXY_AcpKernelHandler(CustomLogger):
                 "prepare",
                 body=body,
                 state=session.state,
+                contentStore=session.content_store,
                 contextLimit=self.context_limit,
                 config=self.config_overrides,
                 tokenCount=session.last_prompt_tokens,
                 injectNudge=inject_nudge,
             )
             session.state = prepared["state"]
+            session.content_store = prepared["contentStore"]
         return prepared
 
     async def _upstream(self, data: dict, prepared: dict, stream: bool) -> Any:
