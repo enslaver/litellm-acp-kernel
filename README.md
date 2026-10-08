@@ -106,6 +106,12 @@ Caveats stated by the paper: single-expert production data, a small pilot on one
 - Multiply by your provider's input price (LiteLLM's spend logs do this) for the cost difference. If your provider discounts cached input, compare cached and uncached tokens separately.
 - Requests that include a `compress` round are the ones that pay for a summary.
 
+To automate this, `scripts/benchmark.py` replays a recorded conversation against two models on your proxy (the same upstream model with and without the callback) and prints prompt tokens, cache-read share and optional cost:
+
+    python scripts/benchmark.py conversation.json --baseline gpt-4o --acp gpt-4o-acp --price-in 2.5 --price-out 10
+
+The conversation is a JSON list of OpenAI-style messages. Recorded assistant replies are sent as history so both arms see identical input; live replies are discarded.
+
 Published measurements for this proxy are welcome as a PR.
 
 ## A note on the name

@@ -36,5 +36,4 @@ Replace large tool results with a small placeholder and let the model fetch the 
 ## 4. Supporting work
 
 - [ ] Persist session state (summaries, content store) to disk or Redis so it survives proxy restarts and works across multiple workers. State is in memory per process today.
-- [ ] Add a benchmark script that replays a recorded conversation with and without the callback and reports prompt tokens, cost and cache-read share, so the README can cite measurements for this proxy rather than the paper's.
 - [ ] Update the README "Not exposed through this proxy yet" note as each item lands.
