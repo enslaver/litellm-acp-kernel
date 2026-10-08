@@ -13,6 +13,8 @@ from litellm.proxy._types import UserAPIKeyAuth
 from litellm_acp_kernel.sidecar_client import AcpKernelSidecar
 
 COMPRESS_TOOL_NAME = "compress"
+INFO_TOOL_NAMES = frozenset({"decompress", "search_context", "acp_status", "acp_retrieve"})
+HIDDEN_TOOL_NAMES = INFO_TOOL_NAMES | {COMPRESS_TOOL_NAME}
 SESSION_HEADER = "x-acp-session"
 DEFAULT_CONTEXT_LIMIT = 128_000
 DEFAULT_MAX_ROUNDS = 3
@@ -26,6 +28,7 @@ INTERNAL_REQUEST_KEYS = frozenset(
 @dataclass
 class _Session:
     state: Optional[dict] = None
+    content_store: Optional[dict] = None
     last_prompt_tokens: Optional[int] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -97,10 +100,10 @@ class _PROXY_AcpKernelHandler(CustomLogger):
         self._record_usage(original.session_key, getattr(response, "usage", None))
         for _ in range(self.max_rounds):
             message = _first_message(response)
-            calls = _compress_calls_from_message(message)
+            calls = _hidden_calls_from_message(message)
             if not calls:
                 return response
-            others = [tc for tc in (message.tool_calls or []) if tc.function.name != COMPRESS_TOOL_NAME]
+            others = [tc for tc in (message.tool_calls or []) if tc.function.name not in HIDDEN_TOOL_NAMES]
             prepared = await self._apply_and_prepare(original, calls)
             if others:
                 message.tool_calls = others
@@ -125,7 +128,7 @@ class _PROXY_AcpKernelHandler(CustomLogger):
                 yield chunk
             if not outcome.compress_calls:
                 return
-            calls = [{"id": c["id"], "arguments": c["arguments"]} for c in outcome.compress_calls.values()]
+            calls = list(outcome.compress_calls.values())
             prepared = await self._apply_and_prepare(original, calls)
             if outcome.has_other_tool_calls:
                 return
@@ -147,8 +150,8 @@ class _PROXY_AcpKernelHandler(CustomLogger):
                 for tc in tool_calls:
                     fn = tc.function
                     index = tc.index if tc.index is not None else 0
-                    if fn is not None and fn.name == COMPRESS_TOOL_NAME:
-                        outcome.compress_calls[index] = {"id": tc.id or "", "arguments": fn.arguments or ""}
+                    if fn is not None and fn.name in HIDDEN_TOOL_NAMES:
+                        outcome.compress_calls[index] = {"id": tc.id or "", "name": fn.name, "arguments": fn.arguments or ""}
                     elif index in outcome.compress_calls:
                         entry = outcome.compress_calls[index]
                         entry["arguments"] += fn.arguments if fn is not None and fn.arguments else ""
@@ -165,28 +168,48 @@ class _PROXY_AcpKernelHandler(CustomLogger):
             yield chunk
 
     async def _apply_and_prepare(self, original: _Original, calls: List[Dict[str, str]]) -> dict:
-        session = self._session(original.session_key)
+        session_key = original.session_key
+        session = self._session(session_key)
+        compress_calls = [c for c in calls if c["name"] == COMPRESS_TOOL_NAME]
+        info_calls = [c for c in calls if c["name"] in INFO_TOOL_NAMES]
         async with session.lock:
-            applied = await self.sidecar.call(
-                "apply",
-                body=original.body,
-                state=session.state,
-                calls=calls,
-                contextLimit=self.context_limit,
-                config=self.config_overrides,
-            )
-            session.state = applied["state"]
+            applied = {"state": session.state, "results": []}
+            if compress_calls:
+                applied = await self.sidecar.call(
+                    "apply",
+                    body=original.body,
+                    state=session.state,
+                    calls=compress_calls,
+                    contextLimit=self.context_limit,
+                    config=self.config_overrides,
+                )
+                session.state = applied["state"]
+            looked_up = {"results": []}
+            if info_calls:
+                looked_up = await self.sidecar.call(
+                    "tool",
+                    body=original.body,
+                    state=session.state,
+                    contentStore=session.content_store,
+                    calls=info_calls,
+                    contextLimit=self.context_limit,
+                    config=self.config_overrides,
+                    tokenCount=session.last_prompt_tokens,
+                )
             prepared = await self.sidecar.call(
                 "prepare",
                 body=original.body,
                 state=session.state,
+                contentStore=session.content_store,
+                sessionKey=session_key,
                 contextLimit=self.context_limit,
                 config=self.config_overrides,
                 tokenCount=None,
                 injectNudge=False,
             )
             session.state = prepared["state"]
-        feedback = _failure_feedback(calls, applied["results"])
+            session.content_store = prepared["contentStore"]
+        feedback = _failure_feedback(compress_calls, applied["results"]) + _tool_results(info_calls, looked_up["results"])
         prepared["messages"] = prepared["messages"] + feedback
         return prepared
 
@@ -197,12 +220,15 @@ class _PROXY_AcpKernelHandler(CustomLogger):
                 "prepare",
                 body=body,
                 state=session.state,
+                contentStore=session.content_store,
+                sessionKey=session_key,
                 contextLimit=self.context_limit,
                 config=self.config_overrides,
                 tokenCount=session.last_prompt_tokens,
                 injectNudge=inject_nudge,
             )
             session.state = prepared["state"]
+            session.content_store = prepared["contentStore"]
         return prepared
 
     async def _upstream(self, data: dict, prepared: dict, stream: bool) -> Any:
@@ -260,13 +286,35 @@ def _first_message(response: Any) -> Any:
     return choices[0].message if choices else None
 
 
-def _compress_calls_from_message(message: Any) -> List[Dict[str, str]]:
+def _hidden_calls_from_message(message: Any) -> List[Dict[str, str]]:
     tool_calls = getattr(message, "tool_calls", None) or []
     return [
-        {"id": tc.id or "", "arguments": tc.function.arguments or ""}
+        {"id": tc.id or "", "name": tc.function.name, "arguments": tc.function.arguments or ""}
         for tc in tool_calls
-        if tc.function.name == COMPRESS_TOOL_NAME
+        if tc.function.name in HIDDEN_TOOL_NAMES
     ]
+
+
+def _tool_results(calls: List[Dict[str, str]], results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_id = {call["id"]: call for call in calls}
+    messages: List[Dict[str, Any]] = []
+    for result in results:
+        call = by_id[result["id"]]
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call["id"],
+                        "type": "function",
+                        "function": {"name": call["name"], "arguments": call["arguments"]},
+                    }
+                ],
+            }
+        )
+        messages.append({"role": "tool", "tool_call_id": call["id"], "content": result["content"]})
+    return messages
 
 
 def _failure_feedback(calls: List[Dict[str, str]], results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

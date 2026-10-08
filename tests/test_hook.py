@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -60,7 +61,7 @@ def compress_args(start: str, end: str) -> str:
     )
 
 
-def tool_call_response(arguments: str, call_id: str = "call_1") -> ModelResponse:
+def tool_call_response(arguments: str, call_id: str = "call_1", name: str = "compress") -> ModelResponse:
     return ModelResponse(
         choices=[
             Choices(
@@ -70,7 +71,7 @@ def tool_call_response(arguments: str, call_id: str = "call_1") -> ModelResponse
                     content=None,
                     tool_calls=[
                         ChatCompletionMessageToolCall(
-                            id=call_id, type="function", function=Function(name="compress", arguments=arguments)
+                            id=call_id, type="function", function=Function(name=name, arguments=arguments)
                         )
                     ],
                 ),
@@ -280,3 +281,211 @@ async def test_sidecar_recovers_after_crash(harness):
     await harness.handler.sidecar._proc.wait()
     data = await prepare(harness, make_conversation(), "c2", session="s2")
     assert any(t["function"]["name"] == "compress" for t in data["tools"])
+
+
+async def compressed_session(harness):
+    conversation = make_conversation()
+    data = await prepare(harness, conversation, "c1")
+    refs = refs_in(data["messages"], "KEY_")
+    harness.next_response = text_response("ok")
+    await harness.handler.async_post_call_success_hook(
+        data, UserAPIKeyAuth(token="k1"), tool_call_response(compress_args(refs[0], refs[1]))
+    )
+    follow_up = conversation + [{"role": "assistant", "content": "ok"}, {"role": "user", "content": "next question"}]
+    return await prepare(harness, follow_up, "c2")
+
+
+async def test_pre_call_exposes_decompress_search_and_status_tools(harness):
+    data = await prepare(harness, make_conversation(), "c1")
+    names = {t["function"]["name"] for t in data["tools"]}
+    assert {"compress", "decompress", "search_context", "acp_status"} <= names
+
+
+async def test_decompress_returns_original_content_without_leaking_it_into_the_prefix(harness):
+    nxt = await compressed_session(harness)
+    harness.next_response = text_response("done")
+
+    await harness.handler.async_post_call_success_hook(
+        nxt, UserAPIKeyAuth(token="k1"), tool_call_response(json.dumps({"blockId": "b1"}), "d1", "decompress")
+    )
+
+    replay = harness.upstream_requests[-1]["messages"]
+    assert replay[-1]["role"] == "tool" and replay[-1]["tool_call_id"] == "d1"
+    assert "KEY_0" in replay[-1]["content"]
+    assert not any("KEY_0" in str(m.get("content")) for m in replay[:-1])
+
+
+async def test_decompress_unknown_block_reports_error_to_model(harness):
+    nxt = await compressed_session(harness)
+    harness.next_response = text_response("done")
+
+    await harness.handler.async_post_call_success_hook(
+        nxt, UserAPIKeyAuth(token="k1"), tool_call_response(json.dumps({"blockId": "b99"}), "d2", "decompress")
+    )
+
+    assert harness.upstream_requests[-1]["messages"][-1]["content"].startswith("decompress failed:")
+
+
+async def test_search_context_finds_compressed_block_by_summary(harness):
+    nxt = await compressed_session(harness)
+    harness.next_response = text_response("done")
+
+    await harness.handler.async_post_call_success_hook(
+        nxt, UserAPIKeyAuth(token="k1"), tool_call_response(json.dumps({"query": "the user asked to remember the marker keys"}), "s1", "search_context")
+    )
+
+    content = harness.upstream_requests[-1]["messages"][-1]["content"]
+    assert "SUMMARY_SENTINEL" in content and content.startswith("b")
+
+
+async def test_acp_status_reports_block_counts(harness):
+    nxt = await compressed_session(harness)
+    harness.next_response = text_response("done")
+
+    await harness.handler.async_post_call_success_hook(
+        nxt, UserAPIKeyAuth(token="k1"), tool_call_response("{}", "st1", "acp_status")
+    )
+
+    report = json.loads(harness.upstream_requests[-1]["messages"][-1]["content"])
+    assert report["activeBlocks"] == 1
+
+
+@pytest.fixture
+async def ccr_harness():
+    handler = _PROXY_AcpKernelHandler(
+        sidecar=AcpKernelSidecar(KERNEL_DIR),
+        models={MODEL},
+        context_limit=4000,
+        max_rounds=2,
+        config_overrides={"ccr": {"enabled": True, "minToolTokens": 100}},
+    )
+    yield Harness(handler)
+    await handler.sidecar.close()
+
+
+BIG_OUTPUT = "TOOL_OUTPUT_SENTINEL " + "line of build output " * 400
+
+
+def tool_conversation() -> List[dict]:
+    return [
+        {"role": "system", "content": "You are a test assistant."},
+        {"role": "user", "content": "run the build"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "bash", "arguments": '{"command": "make"}'}}],
+        },
+        {"role": "tool", "tool_call_id": "t1", "content": BIG_OUTPUT},
+        {"role": "assistant", "content": "build finished"},
+        {"role": "user", "content": "what failed?"},
+    ]
+
+
+async def test_ccr_off_by_default_hides_retrieve_tool_and_keeps_tool_output(harness):
+    data = await prepare(harness, tool_conversation(), "c1")
+    assert "acp_retrieve" not in {t["function"]["name"] for t in data["tools"]}
+    assert any("TOOL_OUTPUT_SENTINEL" in str(m.get("content")) for m in data["messages"])
+
+
+async def test_ccr_replaces_large_tool_result_and_retrieve_returns_original(ccr_harness):
+    data = await prepare(ccr_harness, tool_conversation(), "c1")
+    assert "acp_retrieve" in {t["function"]["name"] for t in data["tools"]}
+    assert not any("TOOL_OUTPUT_SENTINEL" in str(m.get("content")) for m in data["messages"])
+    placeholder = next(m["content"] for m in data["messages"] if m.get("role") == "tool")
+    ref = re.search(r"\bm\d{5}\b", placeholder).group(0)
+    ccr_harness.next_response = text_response("done")
+
+    await ccr_harness.handler.async_post_call_success_hook(
+        data, UserAPIKeyAuth(token="k1"), tool_call_response(json.dumps({"ref": ref}), "r1", "acp_retrieve")
+    )
+
+    replay = ccr_harness.upstream_requests[-1]["messages"]
+    assert replay[-1]["tool_call_id"] == "r1"
+    assert "TOOL_OUTPUT_SENTINEL" in replay[-1]["content"]
+
+
+async def test_ccr_retrieve_unknown_ref_reports_not_found(ccr_harness):
+    data = await prepare(ccr_harness, tool_conversation(), "c1")
+    ccr_harness.next_response = text_response("done")
+
+    await ccr_harness.handler.async_post_call_success_hook(
+        data, UserAPIKeyAuth(token="k1"), tool_call_response(json.dumps({"ref": "m99999"}), "r2", "acp_retrieve")
+    )
+
+    assert "TOOL_OUTPUT_SENTINEL" not in ccr_harness.upstream_requests[-1]["messages"][-1]["content"]
+
+
+async def test_ccr_store_persists_across_turns(ccr_harness):
+    conversation = tool_conversation()
+    data = await prepare(ccr_harness, conversation, "c1")
+    placeholder = next(m["content"] for m in data["messages"] if m.get("role") == "tool")
+    ref = re.search(r"\bm\d{5}\b", placeholder).group(0)
+    follow_up = conversation + [{"role": "assistant", "content": "x"}, {"role": "user", "content": "again"}]
+    nxt = await prepare(ccr_harness, follow_up, "c2")
+    ccr_harness.next_response = text_response("done")
+
+    await ccr_harness.handler.async_post_call_success_hook(
+        nxt, UserAPIKeyAuth(token="k1"), tool_call_response(json.dumps({"ref": ref}), "r3", "acp_retrieve")
+    )
+
+    assert "TOOL_OUTPUT_SENTINEL" in ccr_harness.upstream_requests[-1]["messages"][-1]["content"]
+
+
+async def fresh_harness(monkeypatch, state_dir=None):
+    if state_dir is not None:
+        monkeypatch.setenv("ACP_KERNEL_STATE_DIR", str(state_dir))
+        monkeypatch.setenv("ACP_KERNEL_STATE_DEBOUNCE_MS", "0")
+    else:
+        monkeypatch.delenv("ACP_KERNEL_STATE_DIR", raising=False)
+    handler = _PROXY_AcpKernelHandler(
+        sidecar=AcpKernelSidecar(KERNEL_DIR), models={MODEL}, context_limit=4000, max_rounds=2
+    )
+    return Harness(handler)
+
+
+async def compress_then_restart(monkeypatch, state_dir):
+    first = await fresh_harness(monkeypatch, state_dir)
+    conversation = make_conversation()
+    data = await prepare(first, conversation, "c1")
+    refs = refs_in(data["messages"], "KEY_")
+    first.next_response = text_response("ok")
+    await first.handler.async_post_call_success_hook(
+        data, UserAPIKeyAuth(token="k1"), tool_call_response(compress_args(refs[0], refs[1]))
+    )
+    follow_up = conversation + [{"role": "assistant", "content": "ok"}, {"role": "user", "content": "next question"}]
+    await prepare(first, follow_up, "c2")
+    await asyncio.sleep(0.5)
+    await first.handler.sidecar.close()
+
+    second = await fresh_harness(monkeypatch, state_dir)
+    try:
+        return "\n".join(str(m.get("content")) for m in (await prepare(second, follow_up, "c3"))["messages"])
+    finally:
+        await second.handler.sidecar.close()
+
+
+async def test_state_survives_proxy_restart_with_state_dir(monkeypatch, tmp_path):
+    flattened = await compress_then_restart(monkeypatch, tmp_path / "state")
+    assert "SUMMARY_SENTINEL" in flattened
+    assert "KEY_0" not in flattened
+    assert oct((tmp_path / "state").stat().st_mode & 0o777) == "0o700"
+
+
+async def test_state_is_lost_on_restart_without_state_dir(monkeypatch):
+    flattened = await compress_then_restart(monkeypatch, None)
+    assert "SUMMARY_SENTINEL" not in flattened
+
+
+async def test_expired_state_files_are_removed_at_boot(monkeypatch, tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    stale = state / "old.json"
+    stale.write_text("{}")
+    os.utime(stale, (0, 0))
+    monkeypatch.setenv("ACP_KERNEL_STATE_TTL_DAYS", "1")
+    harness = await fresh_harness(monkeypatch, state)
+    try:
+        await prepare(harness, make_conversation(), "c1")
+    finally:
+        await harness.handler.sidecar.close()
+    assert not stale.exists()
