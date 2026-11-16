@@ -40,15 +40,16 @@ Other kernel behavior that applies here:
 - **Emergency truncation** is a last resort when context is about to overflow.
 - **Window-scaled thresholds.** Nudge thresholds scale with `ACP_KERNEL_CONTEXT_LIMIT`, so set it to the real window of the model you route to.
 
-Not exposed through this proxy yet: the kernel's `decompress`, `search_context` and lossless tool-result offload (CCR). The proxy only injects the `compress` tool, so summaries cannot be restored by the model mid-session. These are tracked in [TODO.md](TODO.md).
+The proxy also exposes `decompress`, `search_context` and `acp_status`. They are read-only lookups: `decompress` returns the original messages of a block (capped at 32K characters) in the tool result, so the folded prefix and its cache stay untouched. 
+**Lossless offload (CCR), off by default.** Enable it with `ACP_KERNEL_CONFIG='{"ccr": {"enabled": true}}'`. Tool results above `ccr.minToolTokens` (default 4000) are stored per session and replaced in the request by a short placeholder with a ref; the model can call `acp_retrieve` to get the exact original back in the tool result. Originals are always returned inline (no export directory), so a retrieval of a large output re-adds those tokens for that turn. The store lives in proxy memory with the session and is not size-capped yet; see [TODO.md](TODO.md).
 
 ### Trade-offs
 
 - **Overhead per request.** The compression doctrine adds roughly 2K tokens of system prompt to every request. In the paper's 16K-window test that was about a 25% fixed overhead and one-shot compaction was cheaper; the overhead amortizes at 64K+ windows. Use this for models with large windows and long sessions.
 - **Compression turns cost extra.** The model writes a summary (output tokens) and the proxy replays the request upstream. The paper measures summary output at a median of 185 tokens, so this pays back quickly, but it is not free.
-- **Summaries are lossy.** Quality depends on the model you route to, and restore tools are not exposed here (see above). Tasks that need verbatim history (audits, compliance, forensics) are outside what this approach is meant for.
+- **Summaries are lossy.** Quality depends on the model you route to, and `decompress` can only restore content the client still sends, since the proxy keeps no copy of the originals. Tasks that need verbatim history (audits, compliance, forensics) are outside what this approach is meant for.
 - **Cache.** Compression replaces a range of history, so provider-side prompt cache is lost from the start of that range onward. The kernel folds the already-consumed increment rather than rewriting the whole history, which keeps the earlier prefix stable; the paper reports 94% cache-read share at active tempo on its own hosts. This proxy has not measured that yet.
-- **Session state is in memory** per proxy process (see below).
+- **Session state is in memory** per proxy process unless `ACP_KERNEL_STATE_DIR` is set (see below).
 
 ## Install
 
@@ -69,8 +70,11 @@ Environment:
 - `ACP_KERNEL_MAX_ROUNDS`: max compress replays per request, default 3
 - `ACP_KERNEL_CONFIG`: JSON overrides for the kernel config
 - `ACP_KERNEL_NODE`: node binary, default from PATH
+- `ACP_KERNEL_STATE_DIR`: persist session state (summaries and, with CCR, stored tool outputs) here so it survives proxy restarts. Off by default. Files can contain conversation content: the directory is created `0700`, so keep it private.
+- `ACP_KERNEL_STATE_TTL_DAYS`: files older than this are deleted at startup, default 7
+- `ACP_KERNEL_STATE_DEBOUNCE_MS`: write coalescing window, default 500. A crash can lose up to this much recent state.
 
-Sessions are keyed by API key, model and `x-acp-session` header. State is in memory per process.
+Sessions are keyed by API key, model and `x-acp-session` header. State is held in memory per process; with `ACP_KERNEL_STATE_DIR` it is also written to disk (via the kernel's crash-safe `StateStore`) and reloaded when a session is not in memory, e.g. after a restart or LRU eviction. Several workers sharing one directory is last-writer-wins and is not coordinated, so pin a session to one worker.
 
 ## Evidence
 
@@ -105,6 +109,12 @@ Caveats stated by the paper: single-expert production data, a small pilot on one
 - LiteLLM logs `usage.prompt_tokens` per request; the callback records it per session. Compare per-session prompt tokens for the same workload with and without your model in `ACP_KERNEL_MODELS`.
 - Multiply by your provider's input price (LiteLLM's spend logs do this) for the cost difference. If your provider discounts cached input, compare cached and uncached tokens separately.
 - Requests that include a `compress` round are the ones that pay for a summary.
+
+To automate this, `scripts/benchmark.py` replays a recorded conversation against two models on your proxy (the same upstream model with and without the callback) and prints prompt tokens, cache-read share and optional cost:
+
+    python scripts/benchmark.py conversation.json --baseline gpt-4o --acp gpt-4o-acp --price-in 2.5 --price-out 10
+
+The conversation is a JSON list of OpenAI-style messages. Recorded assistant replies are sent as history so both arms see identical input; live replies are discarded.
 
 Published measurements for this proxy are welcome as a PR.
 
